@@ -8,6 +8,7 @@ mod key;
 mod ok;
 mod preattestation;
 mod report;
+mod secure_tsc;
 mod verify;
 
 mod clparser;
