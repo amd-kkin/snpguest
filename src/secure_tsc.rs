@@ -32,21 +32,6 @@
 //   read intercept (sev.c: svm_set_intercept_for_msr(..., !snp_is_secure_tsc_enabled()))
 //   only when secure-tsc is on, so if this MSR read succeeds with a plausible value
 //   it proves KVM handed TSC ownership to the PSP.
-//
-// Test 3 – SNP_GUEST_REQUEST TSC_INFO round-trip
-//   Issue SNP_MSG_TSC_INFO_REQ (message type 17) to /dev/sev-guest ourselves using
-//   the same ioctl infrastructure the kernel uses internally (snp_get_tsc_info() in
-//   arch/x86/coco/sev/core.c).  A successful response with non-zero tsc_scale is the
-//   most direct proof that the PSP processed a TSC-related SNP_GUEST_REQUEST.
-//
-//   NOTE: The kernel's /dev/sev-guest driver (6.18) exposes only three ioctls:
-//   SNP_GET_REPORT (0), SNP_GET_DERIVED_KEY (1), SNP_GET_EXT_REPORT (2).  There is
-//   no SNP_GET_TSC_INFO ioctl yet; the kernel calls snp_send_guest_request() directly
-//   from boot code.  We replicate the same call structure by issuing the ioctl with
-//   msg_version=1 (MSG_HDR_VER) and the 128-byte all-zero request body that
-//   SNP_MSG_TSC_INFO_REQ requires, using the same snp_guest_request_ioctl envelope.
-//   This raw ioctl is intentionally left here pending a proper SNP_GET_TSC_INFO ioctl
-//   being added to the kernel uapi and wrapped in the sev crate.
 
 use anyhow::Result;
 use msru::{Accessor, Msr};
@@ -59,7 +44,6 @@ use std::mem; // used in unit tests for size/offset assertions
 /// read proves the PSP programmed the value, not the hypervisor.
 const MSR_GUEST_TSC_FREQ: u32 = 0xC001_0134;
 const TSC_FREQ_MASK: u64 = 0x3_FFFF; // bits 17:0
-
 
 /// Decoded response from SNP_MSG_TSC_INFO_RSP (arch/x86/include/asm/sev.h).
 /// Layout: status(u32), rsvd1(u32), tsc_scale(u64), tsc_offset(u64),
@@ -151,11 +135,17 @@ pub fn is_plausible_tsc_freq(freq_mhz: u64) -> bool {
 /// on a 3 GHz TSC without taking too long in a test suite.
 const MEASURE_SLEEP_NS: u64 = 50_000_000;
 
-/// Maximum allowed deviation between measured TSC rate and MSR value, in ppm.
-const RATE_TOLERANCE_PPM: u64 = 250;
+/// Number of measurement rounds. The best (shortest ns_delta) is kept; the rest
+/// are discarded. Preemption inflates ns_delta asymmetrically, so the minimum
+/// ratio across rounds converges to the true rate — same technique the kernel uses.
+const MEASURE_ROUNDS: usize = 5;
 
 /// Measures the TSC tick frequency in kHz by sampling RDTSC around a
 /// CLOCK_MONOTONIC_RAW sleep and comparing to MSR_AMD64_GUEST_TSC_FREQ.
+///
+/// Takes MEASURE_ROUNDS samples and keeps the one with the smallest elapsed
+/// wall time (closest to the requested sleep), which discards rounds where the
+/// thread was preempted between the RDTSC and clock_gettime bracket points.
 ///
 /// Returns `Ok((measured_khz, msr_khz))` on success.
 pub fn measure_tsc_rate_vs_msr() -> Result<(u64, u64)> {
@@ -163,43 +153,57 @@ pub fn measure_tsc_rate_vs_msr() -> Result<(u64, u64)> {
         .ok_or_else(|| anyhow::anyhow!("MSR_AMD64_GUEST_TSC_FREQ unreadable"))?;
     let msr_khz = msr_mhz * 1000;
 
-    // Read RDTSC and CLOCK_MONOTONIC_RAW in matched pairs.
-    // _rdtsc() is a serialising read on x86; the fence around the sleep ensures
-    // that RDTSC is not reordered across the nanosleep boundary.
-    let (tsc0, t0_ns) = rdtsc_and_clock_ns()?;
-
-    // nanosleep for MEASURE_SLEEP_NS using clock_nanosleep(CLOCK_MONOTONIC_RAW).
     let sleep_req = libc::timespec {
         tv_sec: 0,
         tv_nsec: MEASURE_SLEEP_NS as libc::c_long,
     };
-    // Safety: valid timespec, null remaining pointer (we don't need it).
-    let rc = unsafe {
-        libc::clock_nanosleep(
-            libc::CLOCK_MONOTONIC_RAW,
-            0,
-            &sleep_req,
-            std::ptr::null_mut(),
-        )
-    };
-    if rc != 0 {
-        return Err(anyhow::anyhow!(
-            "clock_nanosleep failed: {}",
-            std::io::Error::from_raw_os_error(rc)
-        ));
+
+    // (tsc_delta, ns_delta) for the best round so far.
+    let mut best: Option<(u64, u64)> = None;
+
+    for _ in 0..MEASURE_ROUNDS {
+        let (tsc0, t0_ns) = rdtsc_and_clock_ns()?;
+
+        // nanosleep for MEASURE_SLEEP_NS.  CLOCK_MONOTONIC_RAW is not accepted by
+        // clock_nanosleep (ENOTSUP); use CLOCK_MONOTONIC for the sleep — the
+        // measurement itself still uses CLOCK_MONOTONIC_RAW on both sides.
+        //
+        // Safety: valid timespec, null remaining pointer (we don't need it).
+        let rc = unsafe {
+            libc::clock_nanosleep(libc::CLOCK_MONOTONIC, 0, &sleep_req, std::ptr::null_mut())
+        };
+        if rc != 0 {
+            return Err(anyhow::anyhow!(
+                "clock_nanosleep failed: {}",
+                std::io::Error::from_raw_os_error(rc)
+            ));
+        }
+
+        let (tsc1, t1_ns) = rdtsc_and_clock_ns()?;
+
+        if t1_ns <= t0_ns || tsc1 <= tsc0 {
+            continue;
+        }
+
+        let ns_delta = t1_ns - t0_ns;
+        let tsc_delta = tsc1 - tsc0;
+
+        // Keep the round with the smallest ns_delta: preemption only ever
+        // inflates elapsed time, so the shortest sample is the least-disturbed.
+        let keep = match best {
+            None => true,
+            Some((_, prev_ns)) => ns_delta < prev_ns,
+        };
+        if keep {
+            best = Some((tsc_delta, ns_delta));
+        }
     }
 
-    let (tsc1, t1_ns) = rdtsc_and_clock_ns()?;
-
-    if t1_ns <= t0_ns || tsc1 <= tsc0 {
-        return Err(anyhow::anyhow!(
-            "TSC or wall clock did not advance (tsc0={tsc0}, tsc1={tsc1}, t0={t0_ns}, t1={t1_ns})"
-        ));
-    }
+    let (tsc_delta, ns_delta) = best.ok_or_else(|| {
+        anyhow::anyhow!("TSC or wall clock did not advance across all measurement rounds")
+    })?;
 
     // measured_khz = tsc_delta / wall_delta_us  (ticks/us == kHz)
-    let tsc_delta = tsc1 - tsc0;
-    let ns_delta = t1_ns - t0_ns;
     // Use u128 for the intermediate product to avoid overflow.
     let measured_khz = (tsc_delta as u128 * 1_000_000 / ns_delta as u128) as u64;
 
@@ -209,8 +213,15 @@ pub fn measure_tsc_rate_vs_msr() -> Result<(u64, u64)> {
 /// Reads RDTSC and CLOCK_MONOTONIC_RAW as close together as possible.
 /// Returns (tsc_value, nanoseconds).
 fn rdtsc_and_clock_ns() -> Result<(u64, u64)> {
-    // Safety: _rdtsc() is always available on x86_64 and has no preconditions.
+    // _rdtsc() returns the tsc that the VM is experiencing, regardless if it was reported by the hypervisor,
+    // or returned by the VMSA
+    if !std::is_x86_feature_detected!("tsc") {
+        return Err(anyhow::anyhow!(
+            "RDTSC instruction not supported on this CPU"
+        ));
+    }
     let tsc = unsafe { std::arch::x86_64::_rdtsc() };
+
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -227,11 +238,13 @@ fn rdtsc_and_clock_ns() -> Result<(u64, u64)> {
     Ok((tsc, ns))
 }
 
-/// Returns true if `measured_khz` is within `RATE_TOLERANCE_PPM` of `msr_khz`.
-pub fn tsc_rate_within_tolerance(measured_khz: u64, msr_khz: u64) -> bool {
-    let diff = measured_khz.abs_diff(msr_khz);
-    // diff/msr_khz < RATE_TOLERANCE_PPM/1_000_000  →  diff*1_000_000 < msr_khz*RATE_TOLERANCE_PPM
-    diff.saturating_mul(1_000_000) < msr_khz.saturating_mul(RATE_TOLERANCE_PPM)
+/// Returns true if `measured_khz` is at or below `msr_khz`.
+///
+/// tsc_factor encodes the percent decrease from nominal (MSR) to mean (measured)
+/// frequency, so the corrected rate can never exceed the nominal.  A measured
+/// rate above the MSR value would indicate a measurement error or a firmware bug.
+pub fn tsc_rate_at_or_below_nominal(measured_khz: u64, msr_khz: u64) -> bool {
+    measured_khz <= msr_khz
 }
 
 #[cfg(test)]
@@ -278,21 +291,16 @@ mod tests {
         assert!(!is_plausible_tsc_freq(u64::MAX));
     }
 
-    // ── tsc_rate_within_tolerance ─────────────────────────────────────────────
+    // ── tsc_rate_at_or_below_nominal ─────────────────────────────────────────
 
     #[test]
-    fn rate_tolerance_boundaries() {
-        let base: u64 = 3_600_000; // 3600 MHz in kHz
-        // Exactly at the limit: 250 ppm of 3_600_000 = 900 kHz
-        let at_limit = base + 900;
-        let just_over = base + 901;
-        assert!(tsc_rate_within_tolerance(base, base));
-        assert!(tsc_rate_within_tolerance(base + 899, base));
-        assert!(!tsc_rate_within_tolerance(at_limit, base));
-        assert!(!tsc_rate_within_tolerance(just_over, base));
-        // Symmetric: measured below MSR
-        assert!(tsc_rate_within_tolerance(base - 899, base));
-        assert!(!tsc_rate_within_tolerance(base - 900, base));
+    fn rate_at_or_below_nominal() {
+        let nominal: u64 = 3_600_000; // 3600 MHz in kHz
+        assert!(tsc_rate_at_or_below_nominal(nominal, nominal));
+        assert!(tsc_rate_at_or_below_nominal(nominal - 1, nominal));
+        assert!(tsc_rate_at_or_below_nominal(0, nominal));
+        assert!(!tsc_rate_at_or_below_nominal(nominal + 1, nominal));
+        assert!(!tsc_rate_at_or_below_nominal(u64::MAX, nominal));
     }
 
     // ── TSC_FREQ_MASK ─────────────────────────────────────────────────────────

@@ -381,7 +381,9 @@ fn secure_tsc_freq_test() -> TestResult {
         Ok(Some(mhz)) if secure_tsc::is_plausible_tsc_freq(mhz) => TestResult {
             name: "GUEST_TSC_FREQ MSR readable and plausible".to_string(),
             stat: TestState::Pass,
-            mesg: Some(format!("{mhz} MHz (PSP-programmed, not intercepted by KVM)")),
+            mesg: Some(format!(
+                "{mhz} MHz (PSP-programmed, not intercepted by KVM)"
+            )),
         },
         Ok(Some(mhz)) => TestResult {
             name: "GUEST_TSC_FREQ MSR readable and plausible".to_string(),
@@ -404,46 +406,41 @@ fn secure_tsc_freq_test() -> TestResult {
     }
 }
 
-/// Test 3: Observed TSC tick rate agrees with MSR_AMD64_GUEST_TSC_FREQ.
+/// Test 3: Observed TSC rate does not exceed MSR_AMD64_GUEST_TSC_FREQ (nominal).
 ///
-/// Measures the TSC frequency by sampling _rdtsc() around a CLOCK_MONOTONIC_RAW
-/// sleep, then compares the result to MSR 0xC0010134 within 250 ppm.
-///
-/// Why this proves TSC is PSP-derived:
-///   snp_secure_tsc_init() reads MSR 0xC0010134, derives snp_tsc_freq_khz, and
-///   overrides x86_platform.calibrate_tsc with it. That feeds the kernel's tsc_khz,
-///   which governs CLOCK_MONOTONIC_RAW. So if the measured TSC/wall rate agrees
-///   with MSR 0xC0010134, both sides trace back to the same PSP-programmed value.
+/// tsc_factor encodes the percent decrease from the PSP-programmed nominal frequency
+/// (MSR 0xC0010134) to the chip's mean frequency.  snp_secure_tsc_init() applies
+/// this correction when deriving snp_tsc_freq_khz, so the measured TSC rate will
+/// be at or below the MSR value — never above it.  A measured rate exceeding the
+/// MSR indicates a measurement error or a firmware bug.
 fn secure_tsc_rate_test() -> TestResult {
     match secure_tsc::measure_tsc_rate_vs_msr() {
         Ok((measured_khz, msr_khz)) => {
-            let diff_ppb = measured_khz
+            let deviation_ppm = measured_khz
                 .abs_diff(msr_khz)
                 .saturating_mul(1_000_000)
                 .checked_div(msr_khz)
                 .unwrap_or(u64::MAX);
-            if secure_tsc::tsc_rate_within_tolerance(measured_khz, msr_khz) {
+            if secure_tsc::tsc_rate_at_or_below_nominal(measured_khz, msr_khz) {
                 TestResult {
-                    name: "TSC rate matches PSP-programmed MSR".to_string(),
+                    name: "TSC rate at or below PSP-programmed nominal".to_string(),
                     stat: TestState::Pass,
                     mesg: Some(format!(
-                        "measured={} kHz, MSR={} kHz, deviation={} ppm",
-                        measured_khz, msr_khz, diff_ppb
+                        "measured={measured_khz} kHz, MSR={msr_khz} kHz, deviation={deviation_ppm} ppm"
                     )),
                 }
             } else {
                 TestResult {
-                    name: "TSC rate matches PSP-programmed MSR".to_string(),
+                    name: "TSC rate at or below PSP-programmed nominal".to_string(),
                     stat: TestState::Fail,
                     mesg: Some(format!(
-                        "measured={} kHz, MSR={} kHz, deviation={} ppm (> 250 ppm)",
-                        measured_khz, msr_khz, diff_ppb
+                        "measured={measured_khz} kHz exceeds MSR={msr_khz} kHz by {deviation_ppm} ppm"
                     )),
                 }
             }
         }
         Err(e) => TestResult {
-            name: "TSC rate matches PSP-programmed MSR".to_string(),
+            name: "TSC rate at or below PSP-programmed nominal".to_string(),
             stat: TestState::Fail,
             mesg: Some(format!("{e}")),
         },
