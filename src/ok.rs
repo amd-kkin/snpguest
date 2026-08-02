@@ -51,7 +51,7 @@ bitfield! {
     pub prevent_host_ibs_bit, _ : 8,8;
     pub btb_isolation_bit, _ : 9,9;
     pub vmpl_sss_bit, _ : 10,10;
-    pub secure_tse_bit, _ : 11,11;
+    pub secure_tsc_bit, _ : 11,11;
     pub vmg_exit_parameter_bit, _ : 12,12;
     reserved_1, _ : 13, 13;
     pub ibs_virtualization_bit, _ : 14,14;
@@ -194,10 +194,10 @@ fn collect_tests() -> Vec<Test> {
                     sub: vec![],
                 },
                 Test {
-                    name: "Secure TSE",
+                    name: "Secure TSC",
                     gen_mask: SNP_MASK,
                     run: Box::new(move || {
-                        run_msr_check(temp_bitfield.secure_tse_bit(), "Secure TSE", true)
+                        run_msr_check(temp_bitfield.secure_tsc_bit(), "Secure TSC", true)
                     }),
                     sub: vec![],
                 },
